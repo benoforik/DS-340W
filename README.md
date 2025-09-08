@@ -1,5 +1,7 @@
 # Predicting Next‑Match Injury Risk in Professional Soccer (Public Data)
 
+# utilized help from LLMs and Machine Learning Models 
+
 > DS 340W • Applied Data Science • Parent‑paper data source: Transfermarkt injury histories; supplemental public sources (FBref, Understat, StatsBomb Open Data)
 
 ---
@@ -101,17 +103,6 @@ python src/py/train_logit.py   --config config/params.yml
 python src/py/train_xgb.py     --config config/params.yml
 python src/py/calibrate.py     --config config/params.yml
 python src/py/shap_report.py   --config config/params.yml
-```
-
-### Option B — R
-
-```r
-# install.packages(c("worldfootballR","dplyr","purrr","lubridate","stringr","readr","data.table","ggplot2"))
-# optional modeling packages: "glmnet","ranger","xgboost","survival","survminer","fastshap"
-
-source("R/scrape_transfermarkt.R")   # writes data/raw/transfermarkt/*.csv
-source("R/fetch_fbref.R")            # writes data/raw/fbref/*.csv
-source("R/merge_build_features.R")   # writes data/processed/features.parquet
 ```
 
 ---
@@ -226,5 +217,3 @@ injuries <- purrr::imap_dfr(clubs, ~purrr::map_dfr(seasons, ~fetch_team_season(.
 if (!dir.exists("data/raw/transfermarkt")) dir.create("data/raw/transfermarkt", recursive = TRUE)
 readr::write_csv(injuries, "data/raw/transfermarkt/injury_history_10clubs_2022_2025.csv")
 ```
-
-> Replace with your preferred error handling and add caching if scraping many seasons. Respect site load limits.
