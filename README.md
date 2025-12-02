@@ -1,219 +1,169 @@
-# Predicting Next‑Match Injury Risk in Professional Soccer (Public Data)
+Overview
 
-# utilized help from LLMs and Machine Learning Models 
+This project builds an end-to-end weekly injury-prediction system using data from Transfermarkt.
+It constructs detailed player-week timelines, engineers injury-history features, trains multiple ML models, and visualizes long-term injury trends.
 
-> DS 340W • Applied Data Science • Parent‑paper data source: Transfermarkt injury histories; supplemental public sources (FBref, Understat, StatsBomb Open Data)
+The pipeline predicts:
 
----
+“Will a player get injured next week?”
 
-## TL;DR
+It also analyzes:
 
-This repo implements an end‑to‑end, **leakage‑safe** pipeline to predict **time‑loss injury risk in the next 7–10 days** for players in Europe’s top clubs using **public data**. It reproduces the data source described in the parent paper (Transfermarkt injury pages) and adds workload/context features from FBref and Understat. Baselines: regularized logistic; advanced: XGBoost/Random Forest; optional: Cox/discrete‑time survival. Models are **calibrated** and **interpreted** with SHAP.
+Changes in injury frequency since 2020
 
----
+How risk evolves with recovery time
 
-## Data Sources (first‑hand access)
+📂 Project Structure
+📁 project/
+│── README.md
+│── transfermarkt_new.csv      # Raw data for ML modeling
+│── transfermarkt.csv          # Full dataset for trend analysis
+│── final_project.Rmd          # Full analysis and modeling pipeline
+│── plots/                     # Generated graphs (optional)
+└── models/                    # Saved models (optional)
 
-* **Injury labels (primary):** Transfermarkt player “Injury history” pages (diagnosis, from, until, days, games missed). Start page: [https://www.transfermarkt.com/](https://www.transfermarkt.com/)
-  *We extract directly, season by season, for the specified clubs.*
-* **Workload proxies (minutes, positions, starts):** FBref match/player logs. [https://fbref.com/en/](https://fbref.com/en/)
-* **Match context (xG, shots, opponent strength):** Understat. [https://understat.com/](https://understat.com/)
-* **Event data (optional leagues):** StatsBomb Open Data (free). [https://github.com/statsbomb/open-data](https://github.com/statsbomb/open-data)
-* **Mirrors for quick prototyping (optional):** Kaggle datasets that replicate Transfermarkt injuries. [https://www.kaggle.com/datasets](https://www.kaggle.com/datasets)
+Key Features
+ 1. Data Cleaning & Standardization
 
-> **ToS & ethics:** Use respectful rate limiting, cache requests, and comply with each site’s Terms of Use. This project uses publicly viewable pages and does **not** attempt to access private data.
+Parse injury dates correctly (multiple formats supported)
 
----
+Convert duration into numeric values
 
-## Repo Structure
+Remove malformed entries
 
-```
-injury-risk-soccer/
-├─ README.md                      # this file
-├─ LICENSE                        # MIT (suggested)
-├─ .gitignore                     # e.g., data/, .env, .Rproj.user, .venv
-├─ config/
-│  ├─ clubs.yml                   # list of clubs + Transfermarkt URL templates
-│  ├─ params.yml                  # feature horizons, CV params, thresholds
-│  └─ secrets-template.env        # example of env keys (no secrets committed)
-├─ data/
-│  ├─ raw/
-│  │  ├─ transfermarkt/           # per-club raw injury HTML/CSV dumps
-│  │  ├─ fbref/                   # raw match & player logs
-│  │  └─ understat/               # raw xG/context
-│  ├─ interim/                    # merged but not yet featured
-│  ├─ processed/                  # feature tables used for modeling
-│  └─ external/                   # optional Kaggle mirrors
-├─ notebooks/
-│  ├─ 00_eda_data_quality.ipynb
-│  ├─ 01_feature_engineering.ipynb
-│  ├─ 02_model_baselines_logit.ipynb
-│  ├─ 03_model_xgboost_rf_shap.ipynb
-│  ├─ 04_calibration_curves.ipynb
-│  └─ 05_survival_time_to_injury.ipynb
-├─ R/
-│  ├─ scrape_transfermarkt.R      # builds injury table per club/season
-│  ├─ fetch_fbref.R               # pulls minutes/starts/positions
-│  ├─ merge_build_features.R      # creates rolling loads, congestion flags
-│  └─ renv.lock                   # optional: pinned R packages
-├─ src/
-│  ├─ py/
-│  │  ├─ build_dataset.py         # merges raw -> processed feature table
-│  │  ├─ tscv.py                  # time‑series + group CV utilities
-│  │  ├─ train_logit.py
-│  │  ├─ train_xgb.py
-│  │  ├─ calibrate.py             # isotonic/Platt, reliability diagrams
-│  │  ├─ eval_metrics.py          # AUROC/AUPRC/F1/Brier/PRC plots
-│  │  └─ shap_report.py           # global/local SHAP plots
-│  └─ rutils/
-│     └─ helpers.R                # small shared R utilities
-├─ scripts/
-│  ├─ 00_pull_injuries.sh         # orchestrates R scrape
-│  ├─ 01_pull_fbref.sh
-│  ├─ 02_features.sh
-│  ├─ 03_train_baselines.sh
-│  ├─ 04_train_xgb.sh
-│  └─ 05_make_figures.sh
-├─ reports/
-│  ├─ figures/                    # SHAP, calibration, PR curves, incidence
-│  └─ paper/
-│     ├─ final_paper.docx (or .qmd/.tex)
-│     └─ slides.pdf               # final 15‑min presentation
-└─ tests/
-   └─ test_data_checks.py         # schema, leakage, splits
-```
+Sort injury sequences per player
 
----
+ 2. Weekly Player Timeline Generation
 
-## Quickstart
+Creates a complete grid:
 
-### Option A — Python
+player × every week between first injury and last injury
 
-```bash
-# create env
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -U pip
-pip install pandas numpy scikit-learn xgboost lightgbm shap matplotlib pyyaml joblib requests beautifulsoup4 tqdm fastparquet pyarrow
 
-# build processed features (after raw data exists)
-python src/py/build_dataset.py --config config/params.yml
+This ensures consistent time-series modeling, even with no injury events.
 
-# train & evaluate
-python src/py/train_logit.py   --config config/params.yml
-python src/py/train_xgb.py     --config config/params.yml
-python src/py/calibrate.py     --config config/params.yml
-python src/py/shap_report.py   --config config/params.yml
-```
+ 3. Feature Engineering
 
----
+For each player-week:
 
-## Parent Paper (data source declared)
+injury_this_week
 
-* **Hoenig, T. et al. (2022)** *Analysis of more than 20,000 injuries in European professional football by using a citizen science‑based approach* — Data sourced from **Transfermarkt** injury pages (clearly specified). Use this as methodological precedent for public media‑sourced injury labels.
+past_injuries (cumulative)
 
-> For DS 340W policy: This choice ensures **first‑hand access** to the same source the paper used, enabling full implementation.
+last_injury_week (forward filled)
 
----
+weeks_since_last_injury (recovery time)
 
-## Feature Set (public‑data friendly)
+injury_next_week (prediction target)
 
-* **Workload:** rolling minutes (1/3/5 matches), %90s completed, days since last match, congestion flag (≤3–4 rest days)
-* **History:** prior time‑loss injuries, days since last injury, counts by diagnosis
-* **Profile:** age, height (if available), position/role
-* **Context:** home/away, opponent strength, xG for/against (Understat), team tempo proxies (shots/pressures)
-* **Label:** injury occurs within next 10 days (binary) or weekly time‑to‑injury (survival)
+ 4. Chronological Train/Test/Validation Split
 
----
+Prevents data leakage:
 
-## Modeling Plan
+70% → training
 
-1. **Splits:** temporal train→val→test (earlier seasons → later), grouped by player to avoid leakage
-2. **Baselines:** class‑weighted logistic (L1/L2), report AUROC, AUPRC, Brier, calibration curve
-3. **Boosted trees:** XGBoost/LightGBM with time‑series CV and probability calibration
-4. **Interpretability:** SHAP global/local; partial‑dependence for rest days & rolling minutes
-5. **Decision value:** threshold selection via PR curves & decision curves (cost of rest vs. cost of injury)
-6. **(Optional)** Cox / discrete‑time survival for time‑to‑injury
+20% → testing
 
----
+10% → validation
 
-## Repro Steps (scripted)
+ 5. Machine Learning Models
+Model	Purpose
+Logistic Regression	Simple linear baseline
+Random Forest	Nonlinear, interpretable, robust
+XGBoost	Handles imbalance well, high performance
 
-```bash
-bash scripts/00_pull_injuries.sh  # R scraper -> data/raw/transfermarkt
-bash scripts/01_pull_fbref.sh     # R scraper -> data/raw/fbref
-bash scripts/02_features.sh       # R -> processed features
-bash scripts/03_train_baselines.sh
-bash scripts/04_train_xgb.sh
-bash scripts/05_make_figures.sh
-```
+Metrics calculated:
 
----
+Confusion Matrix
 
-## DS 340W Deliverables Map
+Precision & Recall
 
-* **Week 1**: Topic + parent paper + data‑access links (this README)
-* **Check‑in #2**: Raw pulls complete; first merged table
-* **Check‑in #3**: Baseline logistic + early calibration plot
-* **Check‑in #4**: XGBoost + SHAP + decision curves
-* **Midterm**: Proposal deck (design, features, leakage controls)
-* **Final**: Paper + slides + repo (figures in `/reports/figures`)
+F1 Score
 
----
+PR-AUC (best for rare-event prediction)
 
-## Contributing & Project Hygiene
+ 6. Trend Analysis (2020–Present)
 
-* Open issues for **data quality** (missing dates/diagnoses), **feature drift**, and **calibration**.
-* Commit only code/notebooks; **never commit raw data** (kept local by default). Use DVC or a cloud bucket if needed.
-* Add unit tests for: split integrity (no future leakage), label windowing, schema checks.
+Plots number of muscular/ligament injuries per season to detect:
 
----
+Are injuries increasing over time?
 
-## License
+ 7. Risk Curve: Time Since Last Injury → Injury Probability
 
-MIT for code. Data remain property of their respective owners; follow each source’s ToS.
+Visualizes short-term re-injury risk for the first 20 weeks after return.
 
----
+ Example Outputs
+Injury Trend Since 2020
 
-## Appendix: R Scrape Skeleton
+ Line plot showing injury counts by season.
 
-```r
-# R/scrape_transfermarkt.R
-library(worldfootballR); library(dplyr); library(purrr); library(lubridate); library(readr)
-seasons <- 2022:2024
-clubs <- list(
-  "Arsenal" = "https://www.transfermarkt.com/arsenal-fc/startseite/verein/11/saison_id/%d",
-  "Manchester City" = "https://www.transfermarkt.com/manchester-city/startseite/verein/281/saison_id/%d",
-  "Liverpool" = "https://www.transfermarkt.com/liverpool-fc/startseite/verein/31/saison_id/%d",
-  "Chelsea" = "https://www.transfermarkt.com/chelsea-fc/startseite/verein/631/saison_id/%d",
-  "Manchester United" = "https://www.transfermarkt.com/manchester-united/startseite/verein/985/saison_id/%d",
-  "Tottenham" = "https://www.transfermarkt.com/tottenham-hotspur/startseite/verein/148/saison_id/%d",
-  "Bayern Munich" = "https://www.transfermarkt.com/fc-bayern-munich/startseite/verein/27/saison_id/%d",
-  "Paris Saint Germain" = "https://www.transfermarkt.com/paris-saint-germain/startseite/verein/583/saison_id/%d",
-  "Barcelona" = "https://www.transfermarkt.com/fc-barcelona/startseite/verein/131/saison_id/%d",
-  "Real Madrid" = "https://www.transfermarkt.com/real-madrid/startseite/verein/418/saison_id/%d"
-)
+Re-Injury Risk Curve
 
-season_window <- function(y) c(as.Date(sprintf("%d-07-01", y)), as.Date(sprintf("%d-06-30", y+1)))
+ Probability of injury vs. weeks since last injury.
 
-fetch_team_season <- function(club, url_fmt, y){
-  p_urls <- tm_team_player_urls(team_url = sprintf(url_fmt, y))
-  Sys.sleep(1)
-  inj <- tm_player_injury_history(player_urls = p_urls)
-  if (is.null(inj) || nrow(inj)==0) return(NULL)
-  rng <- season_window(y)
-  inj %>% mutate(from = suppressWarnings(lubridate::dmy(from)),
-                 until = suppressWarnings(lubridate::dmy(until)),
-                 season = sprintf("%d/%02d", y, (y+1) %% 100),
-                 club = club) %>%
-    filter(!is.na(from), from >= rng[1], from <= rng[2]) %>%
-    transmute(player = player_name, club, season,
-              diagnosis = injury, from, until,
-              duration_days = as.integer(until - from + 1L),
-              games_missed)
-}
+Model Evaluation
 
-injuries <- purrr::imap_dfr(clubs, ~purrr::map_dfr(seasons, ~fetch_team_season(.y, .x, .x2)))
-# write
-if (!dir.exists("data/raw/transfermarkt")) dir.create("data/raw/transfermarkt", recursive = TRUE)
-readr::write_csv(injuries, "data/raw/transfermarkt/injury_history_10clubs_2022_2025.csv")
-```
+ Precision, Recall, F1, and PR-AUC comparisons across models.
+
+ Technologies Used
+Category	Tools
+Data Wrangling	tidyverse, lubridate, tidyr
+Machine Learning	ranger, xgboost, randomForest
+Evaluation	caret, PRROC
+Visualization	ggplot2
+Reproducibility	R Markdown
+▶️ How to Run the Project
+
+Clone the repository
+
+Ensure the CSV files are in your working directory
+
+Open the .Rmd or .R file in RStudio
+
+Install dependencies:
+
+install.packages(c("tidyverse", "lubridate", "randomForest", 
+                   "PRROC", "caret", "xgboost", "ranger"))
+
+
+Run the script top-to-bottom
+
+View generated plots and model performance outputs
+
+ Use Cases
+
+Player workload monitoring
+
+Injury prevention analytics
+
+Training & rehabilitation optimization
+
+Research in sports science
+
+Predictive modeling pipeline for athlete health
+
+ Notes
+
+Injury events are rare, so PR-AUC is the best metric.
+
+Weeks with no prior injury use 999 as placeholder recovery time.
+
+Trend analysis uses season strings like "20/21", converted to numeric.
+
+The dataset is inherently imbalanced — XGBoost mitigates this with scale_pos_weight.
+
+ Summary
+
+This repository provides a fully reproducible:
+
+Injury forecasting system
+
+Weekly player-timeline builder
+
+ML comparison framework
+
+Trend analysis dashboard
+
+Re-injury risk quantification
+
+It demonstrates how machine learning and data science can support athlete health and sports performance decisions.
