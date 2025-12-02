@@ -1,0 +1,320 @@
+---
+title: "Final Project"
+format: html
+editor: visual
+---
+
+```{r}
+# Install once (uncomment if needed)
+# install.packages(c("tidyverse", "lubridate", "randomForest", "PRROC", "caret"))
+# install.packages("xgboost")
+
+library(tidyverse)
+library(lubridate)
+library(randomForest)
+library(xgboost)
+library(PRROC)
+library(caret)
+library(ranger)
+
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+
+inj_raw <- read_csv("transfermarkt_new.csv")
+inj <- inj_raw %>%
+  rename(
+    player        = player_name,
+    diagnosis     = Injury,
+    from_raw      = from,
+    until_raw     = until,
+    days_text     = Days
+  ) %>%
+  mutate(
+    from  = parse_date_time(from_raw,  orders = c("mdy", "ymd")),
+    until = parse_date_time(until_raw, orders = c("mdy", "ymd")),
+
+    duration_days = days_text %>%
+      str_remove(" days") %>%
+      as.numeric(),
+
+    club = NA_character_
+  ) %>%
+  select(player, club, diagnosis, from, until, duration_days,
+         `Games missed`, Season, player_id) %>%
+  drop_na(from) %>%
+  arrange(player, from)
+
+
+```
+
+```{r}
+# ---- Build weekly grid per player ----
+start_date <- min(inj$from, na.rm = TRUE)
+end_date   <- max(inj$from, na.rm = TRUE)
+
+all_weeks <- tibble(week_start = seq(from = floor_date(start_date, "week"),
+                                     to   = floor_date(end_date,   "week"),
+                                     by   = "1 week"))
+
+players <- inj %>% distinct(player)
+
+player_weeks <- players %>%
+  crossing(all_weeks) %>%
+  arrange(player, week_start)
+
+library(tidyr)  # add this at the top with your other libraries
+
+# injuries as week-start events
+inj_weeks <- inj %>%
+  mutate(week_start = floor_date(from, "week")) %>%
+  select(player, week_start, diagnosis)
+
+weekly_features <- player_weeks %>%
+  left_join(inj_weeks %>% mutate(injury_this_week = 1L),
+            by = c("player", "week_start")) %>%
+  mutate(injury_this_week = if_else(is.na(injury_this_week), 0L, injury_this_week)) %>%
+  group_by(player) %>%
+  arrange(week_start, .by_group = TRUE) %>%
+  mutate(
+    past_injuries    = lag(cumsum(injury_this_week), default = 0L),
+    last_injury_week = if_else(injury_this_week == 1L, week_start, as.Date(NA))
+  ) %>%
+  # forward-fill last_injury_week within each player
+  fill(last_injury_week, .direction = "down") %>%
+  mutate(
+    weeks_since_last_injury = as.numeric(difftime(week_start, last_injury_week, units = "weeks")),
+    weeks_since_last_injury = if_else(is.na(weeks_since_last_injury), 999, weeks_since_last_injury)
+  ) %>%
+  ungroup()
+
+# Label: injury in the NEXT week
+weekly_features <- weekly_features %>%
+  group_by(player) %>%
+  arrange(week_start, .by_group = TRUE) %>%
+  mutate(
+    injury_next_week = lead(injury_this_week, 1, default = 0L)
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+df <- weekly_features %>%
+  filter(!is.na(injury_next_week)) %>%
+  arrange(week_start)
+
+unique_weeks <- sort(unique(df$week_start))
+n_weeks <- length(unique_weeks)
+
+train_cut <- unique_weeks[round(0.7 * n_weeks)]
+test_cut  <- unique_weeks[round(0.9 * n_weeks)]
+
+train_df <- df %>% filter(week_start <= train_cut)
+test_df  <- df %>% filter(week_start > train_cut & week_start <= test_cut)
+val_df   <- df %>% filter(week_start > test_cut)
+
+# pick some starter features (you can add more later)
+feature_cols <- c("past_injuries", "weeks_since_last_injury")
+
+X_train <- as.matrix(train_df[, feature_cols])
+y_train <- as.factor(train_df$injury_next_week)
+
+X_test  <- as.matrix(test_df[, feature_cols])
+y_test  <- as.factor(test_df$injury_next_week)
+
+rf_train <- train_df[, c(feature_cols, "injury_next_week")]
+
+# ---- Logistic Regression ----
+logit_model <- glm(injury_next_week ~ .,
+                   data = train_df[, c(feature_cols, "injury_next_week")],
+                   family = binomial)
+
+logit_probs <- predict(logit_model, newdata = test_df[, feature_cols], type = "response")
+logit_pred  <- ifelse(logit_probs >= 0.5, 1, 0)
+
+
+
+```
+
+```{r}
+library(ranger)
+
+rf_train$injury_next_week <- as.factor(rf_train$injury_next_week)
+
+
+set.seed(42)
+rf_model <- ranger(
+  injury_next_week ~ .,
+  data        = rf_train,
+  num.trees   = 200,
+  probability = TRUE
+)
+
+rf_pred_obj <- predict(rf_model, data = test_df[, feature_cols])
+rf_pred_mat <- rf_pred_obj$predictions
+
+# If it's a matrix (proper classification), take the column for class "1"
+if (is.matrix(rf_pred_mat)) {
+  # colnames are usually "0" and "1"
+  rf_probs <- rf_pred_mat[, "1"]
+} else {
+  # fallback: it's just a numeric vector of probs
+  rf_probs <- as.numeric(rf_pred_mat)
+}
+
+rf_pred <- ifelse(rf_probs >= 0.5, 1, 0)
+
+library(xgboost)
+
+dtrain <- xgb.DMatrix(data = X_train,
+                      label = as.numeric(as.character(y_train)))
+dtest  <- xgb.DMatrix(data = X_test,
+                      label = as.numeric(as.character(y_test)))
+
+pos_weight <- sum(y_train == "0") / sum(y_train == "1")
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 4,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = pos_weight
+)
+
+set.seed(42)
+xgb_model <- xgb.train(
+  params = params,
+  data   = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+xgb_probs <- predict(xgb_model, dtest)
+xgb_pred  <- ifelse(xgb_probs >= 0.5, 1, 0)
+```
+
+```{r}
+f1_score <- function(true, pred) {
+  cm <- confusionMatrix(as.factor(pred), as.factor(true), positive = "1")
+  precision <- cm$byClass["Precision"]
+  recall    <- cm$byClass["Recall"]
+  f1 <- 2 * precision * recall / (precision + recall)
+  list(cm = cm, f1 = f1, precision = precision, recall = recall)
+}
+
+pr_auc_from_probs <- function(probs, true) {
+  # true factor -> numeric 0/1
+  y_num <- as.numeric(as.character(true))
+  # scores for positive vs negative
+  pr <- pr.curve(scores.class0 = probs[y_num == 1],
+                 scores.class1 = probs[y_num == 0],
+                 curve = FALSE)
+  pr$auc.integral
+}
+
+# Logistic
+cat("\n== Logistic Regression ==\n")
+logit_eval <- f1_score(test_df$injury_next_week, logit_pred)
+print(logit_eval$cm)
+cat("F1:", logit_eval$f1, "\n")
+cat("PR-AUC:", pr_auc_from_probs(logit_probs, y_test), "\n")
+
+# Random Forest
+cat("\n== Random Forest ==\n")
+rf_eval <- f1_score(test_df$injury_next_week, rf_pred)
+print(rf_eval$cm)
+cat("F1:", rf_eval$f1, "\n")
+cat("PR-AUC:", pr_auc_from_probs(rf_probs, y_test), "\n")
+
+# XGBoost
+cat("\n== XGBoost ==\n")
+xgb_eval <- f1_score(test_df$injury_next_week, xgb_pred)
+print(xgb_eval$cm)
+cat("F1:", xgb_eval$f1, "\n")
+cat("PR-AUC:", pr_auc_from_probs(xgb_probs, y_test), "\n")
+
+```
+
+```{r}
+library(tidyverse)
+
+
+# ---- Load full cleaned dataset ----
+inj <- read_csv("transfermarkt.csv")
+
+# ---- Extract numeric season-start year (e.g., "20/21" → 20) ----
+inj <- inj %>%
+  mutate(season_start = Season %>% str_split("/") %>% map_int(~ as.integer(.x[1])))
+
+# ---- Keep only seasons >= 20 (2020 → "20/21") ----
+inj_2020_on <- inj %>%
+  filter(season_start >= 20)
+
+# ---- Count injuries per season ----
+season_counts <- inj_2020_on %>%
+  count(season_start) %>%
+  arrange(season_start)
+
+# ---- Convert season numbers to readable labels ----
+season_counts <- season_counts %>%
+  mutate(season_label = paste0(season_start, "/", season_start + 1))
+
+# ---- Plot the trend ----
+ggplot(season_counts, aes(x = season_label, y = n, group = 1)) +
+  geom_line(color = "#cc8a00", size = 1.2) +
+  geom_point(color = "#cc8a00", size = 4) +
+  labs(
+    title = "Trend in Muscular/Ligament Injuries Since 2020",
+    x = "Season",
+    y = "Number of Muscular/Ligament Injuries"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Make sure these exist from earlier steps:
+# weekly_features has columns: weeks_since_last_injury, injury_next_week
+
+risk_by_gap <- weekly_features %>%
+  # cap huge values (999 = never injured yet)
+  mutate(
+    gap_weeks = pmin(weeks_since_last_injury, 20)  # focus on first 20 weeks
+  ) %>%
+  group_by(gap_weeks) %>%
+  summarise(
+    n_weeks    = n(),
+    injury_rate = mean(injury_next_week)  # probability of injury next week
+  ) %>%
+  filter(n_weeks >= 30)  # keep bins with enough data (optional)
+
+ggplot(risk_by_gap, aes(x = gap_weeks, y = injury_rate)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Injury Risk vs. Time Since Last Injury",
+    x        = "Weeks since last injury (capped at 20)",
+    y        = "Probability of injury in the next week",
+    subtitle = "Transfermarkt injury data – player-week level"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+
+```
